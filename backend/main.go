@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -11,13 +10,14 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
 )
 
-var db *sql.DB
+var db *gorm.DB
 var jwtSecret []byte
 
 // Models
@@ -29,20 +29,25 @@ const (
 )
 
 type AppUser struct {
-	ID        int64     `json:"id"`
-	Username  string    `json:"username"`
-	Password  string    `json:"-"`
-	Role      Role      `json:"role"`
+	ID        int64     `gorm:"primaryKey" json:"id"`
+	Username  string    `gorm:"unique;not null" json:"username"`
+	Password  string    `gorm:"not null" json:"-"`
+	Role      Role      `gorm:"type:varchar(50);default:'USER'" json:"role"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+	Tasks     []Task    `gorm:"foreignKey:UserID" json:"tasks,omitempty"`
 }
 
 type Task struct {
-	ID          int64     `json:"id"`
-	Title       string    `json:"title"`
+	ID          int64     `gorm:"primaryKey" json:"id"`
+	Title       string    `gorm:"not null" json:"title"`
 	Description string    `json:"description"`
-	Completed   bool      `json:"completed"`
+	Completed   bool      `gorm:"default:false" json:"completed"`
 	Subject     string    `json:"category"`
 	DueDate     string    `json:"dueDate"`
 	UserID      int64     `json:"-"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
 // DTOs
@@ -142,25 +147,20 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now()
-	res, err := db.Exec("INSERT INTO users (username, password, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-		req.Username, hashedPassword, RoleUser, now, now)
-	if err != nil {
+	user := AppUser{
+		Username: req.Username,
+		Password: string(hashedPassword),
+		Role:     RoleUser,
+	}
+
+	if err := db.Create(&user).Error; err != nil {
 		if strings.Contains(err.Error(), "Duplicate entry") {
 			sendResponse(w, http.StatusBadRequest, "Username already taken", nil)
 			return
 		}
-		log.Println("Insert user error:", err)
+		log.Println("Create user error:", err)
 		sendResponse(w, http.StatusInternalServerError, "Database error", nil)
 		return
-	}
-
-	id, _ := res.LastInsertId()
-	
-	user := AppUser{
-		ID:       id,
-		Username: req.Username,
-		Role:     RoleUser,
 	}
 
 	sendResponse(w, http.StatusOK, "OK", user)
@@ -174,13 +174,8 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var user AppUser
-	var hashedPassword string
-	
-	err := db.QueryRow("SELECT id, username, password, role FROM users WHERE username = ?", req.Username).
-		Scan(&user.ID, &user.Username, &hashedPassword, &user.Role)
-	
-	if err != nil {
-		if err == sql.ErrNoRows {
+	if err := db.Where("username = ?", req.Username).First(&user).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
 			sendResponse(w, http.StatusUnauthorized, "Invalid credentials", nil)
 			return
 		}
@@ -189,7 +184,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(req.Password)); err != nil {
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
 		sendResponse(w, http.StatusUnauthorized, "Invalid credentials", nil)
 		return
 	}
@@ -217,28 +212,22 @@ func createTaskHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := getUserIdFromRequest(r)
-	now := time.Now()
-
-	var dueDate interface{}
-	if req.DueDate != "" {
-		dueDate = req.DueDate
-	} else {
-		dueDate = nil
+	task := Task{
+		Title:       req.Title,
+		Description: req.Description,
+		Completed:   req.Completed,
+		Subject:     req.Subject,
+		DueDate:     req.DueDate,
+		UserID:      userID,
 	}
 
-	res, err := db.Exec(`INSERT INTO tasks 
-		(title, description, completed, subject, due_date, created_at, updated_at, user_id) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		req.Title, req.Description, req.Completed, req.Subject, dueDate, now, now, userID)
-		
-	if err != nil {
+	if err := db.Create(&task).Error; err != nil {
 		log.Println("Insert task error:", err)
 		sendResponse(w, http.StatusInternalServerError, "Database error", nil)
 		return
 	}
 
-	id, _ := res.LastInsertId()
-	req.ID = id
+	req.ID = task.ID
 	sendResponse(w, http.StatusOK, "OK", req)
 }
 
@@ -250,29 +239,26 @@ func updateTaskHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	userID := getUserIdFromRequest(r)
-	now := time.Now()
 	
-	var dueDate interface{}
-	if req.DueDate != "" {
-		dueDate = req.DueDate
-	} else {
-		dueDate = nil
-	}
-
-	result, err := db.Exec(`UPDATE tasks 
-		SET title = ?, description = ?, completed = ?, subject = ?, due_date = ?, updated_at = ?
-		WHERE id = ? AND user_id = ?`,
-		req.Title, req.Description, req.Completed, req.Subject, dueDate, now, req.ID, userID)
-		
-	if err != nil {
-		log.Println("Update task error:", err)
+	var task Task
+	if err := db.Where("id = ? AND user_id = ?", req.ID, userID).First(&task).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
+			sendResponse(w, http.StatusNotFound, "Task not found or not yours", nil)
+			return
+		}
 		sendResponse(w, http.StatusInternalServerError, "Database error", nil)
 		return
 	}
 
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
-		sendResponse(w, http.StatusNotFound, "Task not found or not yours", nil)
+	task.Title = req.Title
+	task.Description = req.Description
+	task.Completed = req.Completed
+	task.Subject = req.Subject
+	task.DueDate = req.DueDate
+
+	if err := db.Save(&task).Error; err != nil {
+		log.Println("Update task error:", err)
+		sendResponse(w, http.StatusInternalServerError, "Database error", nil)
 		return
 	}
 
@@ -282,42 +268,11 @@ func updateTaskHandler(w http.ResponseWriter, r *http.Request) {
 func getTasksHandler(w http.ResponseWriter, r *http.Request) {
 	userID := getUserIdFromRequest(r)
 
-	rows, err := db.Query(`SELECT id, title, description, completed, subject, due_date 
-		FROM tasks WHERE user_id = ?`, userID)
-	if err != nil {
+	var tasks []Task
+	if err := db.Where("user_id = ?", userID).Find(&tasks).Error; err != nil {
 		log.Println("Select tasks error:", err)
 		sendResponse(w, http.StatusInternalServerError, "Database error", nil)
 		return
-	}
-	defer rows.Close()
-
-	var tasks []Task
-	for rows.Next() {
-		var t Task
-		var dueDate sql.NullString
-		var desc sql.NullString
-		var subj sql.NullString
-		var compRaw sql.RawBytes
-		
-		if err := rows.Scan(&t.ID, &t.Title, &desc, &compRaw, &subj, &dueDate); err != nil {
-			log.Println("Scan task error:", err)
-			continue
-		}
-		
-		if len(compRaw) > 0 && (compRaw[0] == 1 || compRaw[0] == '1') {
-			t.Completed = true
-		} else {
-			t.Completed = false
-		}
-		
-		t.Description = desc.String
-		t.Subject = subj.String
-		t.DueDate = dueDate.String
-		tasks = append(tasks, t)
-	}
-
-	if tasks == nil {
-		tasks = []Task{}
 	}
 
 	sendResponse(w, http.StatusOK, "OK", tasks)
@@ -334,17 +289,8 @@ func getTaskByIdHandler(w http.ResponseWriter, r *http.Request) {
 	userID := getUserIdFromRequest(r)
 
 	var t Task
-	var dueDate sql.NullString
-	var desc sql.NullString
-	var subj sql.NullString
-	var compRaw sql.RawBytes
-
-	err = db.QueryRow(`SELECT id, title, description, completed, subject, due_date 
-		FROM tasks WHERE id = ? AND user_id = ?`, id, userID).
-		Scan(&t.ID, &t.Title, &desc, &compRaw, &subj, &dueDate)
-	
-	if err != nil {
-		if err == sql.ErrNoRows {
+	if err := db.Where("id = ? AND user_id = ?", id, userID).First(&t).Error; err != nil {
+		if err == gorm.ErrRecordNotFound {
 			sendResponse(w, http.StatusNotFound, "Task not found", nil)
 			return
 		}
@@ -352,15 +298,6 @@ func getTaskByIdHandler(w http.ResponseWriter, r *http.Request) {
 		sendResponse(w, http.StatusInternalServerError, "Database error", nil)
 		return
 	}
-	
-	if len(compRaw) > 0 && (compRaw[0] == 1 || compRaw[0] == '1') {
-		t.Completed = true
-	} else {
-		t.Completed = false
-	}
-	t.Description = desc.String
-	t.Subject = subj.String
-	t.DueDate = dueDate.String
 
 	sendResponse(w, http.StatusOK, "OK", t)
 }
@@ -375,15 +312,14 @@ func deleteTaskHandler(w http.ResponseWriter, r *http.Request) {
 
 	userID := getUserIdFromRequest(r)
 
-	result, err := db.Exec("DELETE FROM tasks WHERE id = ? AND user_id = ?", id, userID)
-	if err != nil {
-		log.Println("Delete task error:", err)
+	result := db.Where("id = ? AND user_id = ?", id, userID).Delete(&Task{})
+	if result.Error != nil {
+		log.Println("Delete task error:", result.Error)
 		sendResponse(w, http.StatusInternalServerError, "Database error", nil)
 		return
 	}
 
-	rows, _ := result.RowsAffected()
-	if rows == 0 {
+	if result.RowsAffected == 0 {
 		sendResponse(w, http.StatusNotFound, "Task not found or not yours", nil)
 		return
 	}
@@ -396,41 +332,11 @@ func getTasksByStatusHandler(w http.ResponseWriter, r *http.Request) {
 	completed := completedStr == "true"
 	userID := getUserIdFromRequest(r)
 
-	rows, err := db.Query(`SELECT id, title, description, completed, subject, due_date 
-		FROM tasks WHERE user_id = ? AND completed = ?`, userID, completed)
-	if err != nil {
+	var tasks []Task
+	if err := db.Where("user_id = ? AND completed = ?", userID, completed).Find(&tasks).Error; err != nil {
 		log.Println("Select tasks by status error:", err)
 		sendResponse(w, http.StatusInternalServerError, "Database error", nil)
 		return
-	}
-	defer rows.Close()
-
-	var tasks []Task
-	for rows.Next() {
-		var t Task
-		var dueDate sql.NullString
-		var desc sql.NullString
-		var subj sql.NullString
-		var compRaw sql.RawBytes
-		
-		if err := rows.Scan(&t.ID, &t.Title, &desc, &compRaw, &subj, &dueDate); err != nil {
-			log.Println("Scan task error:", err)
-			continue
-		}
-		
-		if len(compRaw) > 0 && (compRaw[0] == 1 || compRaw[0] == '1') {
-			t.Completed = true
-		} else {
-			t.Completed = false
-		}
-		t.Description = desc.String
-		t.Subject = subj.String
-		t.DueDate = dueDate.String
-		tasks = append(tasks, t)
-	}
-
-	if tasks == nil {
-		tasks = []Task{}
 	}
 
 	sendResponse(w, http.StatusOK, "OK", tasks)
@@ -461,20 +367,22 @@ func initDB() {
 	dbPort := os.Getenv("DB_PORT")
 	dbName := os.Getenv("DB_NAME")
 
-	// Construct DSN
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", dbUser, dbPass, dbHost, dbPort, dbName)
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?charset=utf8mb4&parseTime=True&loc=Local", 
+		dbUser, dbPass, dbHost, dbPort, dbName)
 
-	db, err = sql.Open("mysql", dsn)
+	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatal("Error connecting to database: ", err)
 	}
 
-	if err = db.Ping(); err != nil {
-		log.Println("WARNING: Database connection failed. Make sure MySQL is running and DB '" + dbName + "' exists.")
-		log.Println("Error: ", err)
-	} else {
-		log.Printf("Successfully connected to MySQL database (%s)!\n", dbName)
+	// Auto Migration
+	log.Println("Running Auto-Migration...")
+	err = db.AutoMigrate(&AppUser{}, &Task{})
+	if err != nil {
+		log.Fatal("Auto-Migration failed: ", err)
 	}
+
+	log.Printf("Successfully connected to MySQL database (%s) and migrated tables!\n", dbName)
 }
 
 func main() {
@@ -492,7 +400,6 @@ func main() {
 	jwtSecret = []byte(secretStr)
 
 	initDB()
-	defer db.Close()
 
 	mux := http.NewServeMux()
 
