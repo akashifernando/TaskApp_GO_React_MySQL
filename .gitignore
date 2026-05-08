@@ -1,0 +1,18 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+backend/main
+
+# OS generated files
+.DS_Store
+
+# Environment variables
+.env
+backend/.env
+
+# Dependencies
+vendor/
+node_modules/

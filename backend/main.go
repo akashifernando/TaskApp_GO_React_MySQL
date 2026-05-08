@@ -6,17 +6,19 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/joho/godotenv"
 	"golang.org/x/crypto/bcrypt"
 )
 
 var db *sql.DB
-var jwtSecret = []byte("secreteJwtString=abc123def456ghi789jkl012mno345pqr678stu901vwx234yz567abc890def123")
+var jwtSecret []byte
 
 // Models
 type Role string
@@ -452,21 +454,43 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 func initDB() {
 	var err error
-	dsn := "root:root@tcp(localhost:3306)/tasks"
+
+	dbUser := os.Getenv("DB_USER")
+	dbPass := os.Getenv("DB_PASS")
+	dbHost := os.Getenv("DB_HOST")
+	dbPort := os.Getenv("DB_PORT")
+	dbName := os.Getenv("DB_NAME")
+
+	// Construct DSN
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s", dbUser, dbPass, dbHost, dbPort, dbName)
+
 	db, err = sql.Open("mysql", dsn)
 	if err != nil {
 		log.Fatal("Error connecting to database: ", err)
 	}
 
 	if err = db.Ping(); err != nil {
-		log.Println("WARNING: Database connection failed. Make sure MySQL is running and DB 'tasks' exists.")
+		log.Println("WARNING: Database connection failed. Make sure MySQL is running and DB '" + dbName + "' exists.")
 		log.Println("Error: ", err)
 	} else {
-		log.Println("Successfully connected to MySQL database!")
+		log.Printf("Successfully connected to MySQL database (%s)!\n", dbName)
 	}
 }
 
 func main() {
+	// Load .env file
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("No .env file found, using system environment variables")
+	}
+
+	// Initialize JWT Secret from environment
+	secretStr := os.Getenv("JWT_SECRET")
+	if secretStr == "" {
+		log.Fatal("JWT_SECRET environment variable is not set")
+	}
+	jwtSecret = []byte(secretStr)
+
 	initDB()
 	defer db.Close()
 
